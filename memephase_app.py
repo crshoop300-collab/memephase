@@ -51,9 +51,42 @@ def fetch_geckoterminal_ohlcv(network, pool_address, timeframe="minute", aggrega
             candles.append({"time": ts, "open": float(c[1]), "high": float(c[2]),
                             "low": float(c[3]), "close": float(c[4])})
         candles.sort(key=lambda x: x["time"])
-        return candles
+        # Remove duplicate timestamps (GT sometimes returns dupes)
+        seen, deduped = set(), []
+        for c in candles:
+            if c["time"] not in seen and not (c["open"]==0 and c["close"]==0):
+                seen.add(c["time"]); deduped.append(c)
+        return deduped
     except Exception as e:
         print(f"GeckoTerminal OHLCV err: {e}"); return []
+
+def fetch_geckoterminal_ohlcv_v2(network, pool_address, timeframe="minute", aggregate=15, limit=300):
+    """Alternate GeckoTerminal URL format (some chains use different slug)."""
+    # Try the onchain CoinGecko endpoint (same data, slightly different path)
+    url = f"https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}"
+    params = {"aggregate": str(aggregate), "limit": str(limit), "currency": "usd", "token": "base"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if not r.ok:
+            print(f"GT v2 {r.status_code}: {r.text[:200]}")
+            return []
+        raw = r.json()
+        ohlcv_list = (raw.get("data") or {}).get("attributes", {}).get("ohlcv_list", [])
+        candles = []
+        for c in ohlcv_list:
+            ts = int(c[0])
+            o,h,l,cl = float(c[1]),float(c[2]),float(c[3]),float(c[4])
+            if h==0 and l==0 and o==0 and cl==0: continue
+            candles.append({"time":ts,"open":o,"high":h,"low":l,"close":cl})
+        candles.sort(key=lambda x: x["time"])
+        # Remove duplicate timestamps
+        seen, deduped = set(), []
+        for c in candles:
+            if c["time"] not in seen:
+                seen.add(c["time"]); deduped.append(c)
+        return deduped
+    except Exception as e:
+        print(f"GT v2 err: {e}"); return []
 
 def fetch_trending_coingecko():
     try:
@@ -382,7 +415,11 @@ async function loadChart(tfKey) {
     const r = await fetch(`/api/ohlcv?pair=${currentPairAddr}&chain=${currentChainId||'solana'}&tf=${p.tf}&agg=${p.agg}`);
     const data = await r.json();
     if (!data.candles || data.candles.length === 0) {
-      chartEl.innerHTML = '<div style="padding:40px;text-align:center;color:var(--sub);font-size:13px">📊 No chart data for this timeframe yet.<br><span style="font-size:11px">Try a longer timeframe or a more established token.</span></div>';
+      chartEl.innerHTML = `<div style="padding:40px;text-align:center;color:var(--sub);font-size:13px">
+        📊 No chart data for this timeframe.<br>
+        <span style="font-size:11px;display:block;margin-top:6px">Try a longer timeframe (1H or 1D) — very new tokens may only have daily data.</span>
+        ${data.error ? '<span style="font-size:10px;color:#ef4444;display:block;margin-top:4px">'+data.error+'</span>' : ''}
+      </div>`;
       currentChart = null; return;
     }
     if (!currentChart) { currentChart = initChart(); }
@@ -642,8 +679,30 @@ def api_ohlcv():
     agg       = request.args.get("agg","15").strip()
     if not pair_addr: return jsonify({"error":"No pair","candles":[]}),400
     network = CHAIN_MAP.get(chain, chain)
+    # Try GeckoTerminal
     candles = fetch_geckoterminal_ohlcv(network, pair_addr, tf, agg)
-    return jsonify({"candles": candles})
+    if candles:
+        return jsonify({"candles": candles, "source": "geckoterminal"})
+    # Fallback: try alternate GT URL format
+    candles = fetch_geckoterminal_ohlcv_v2(network, pair_addr, tf, agg)
+    if candles:
+        return jsonify({"candles": candles, "source": "geckoterminal_v2"})
+    return jsonify({"candles": [], "error": "No chart data available"})
+
+@app.route("/api/debug")
+def api_debug():
+    """Debug endpoint to test GeckoTerminal connectivity."""
+    pair_addr = request.args.get("pair","0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640").strip()
+    network   = request.args.get("network","eth").strip()
+    url1 = f"{GECKOTERMINAL_BASE}/networks/{network}/pools/{pair_addr}/ohlcv/minute"
+    results = {}
+    try:
+        r = requests.get(url1, headers={"Accept":"application/json;version=20230302"},
+                         params={"aggregate":15,"limit":10,"currency":"usd","token":"base"}, timeout=10)
+        results["gt_v1"] = {"status": r.status_code, "keys": list(r.json().keys()) if r.ok else r.text[:200]}
+    except Exception as e:
+        results["gt_v1"] = {"error": str(e)}
+    return jsonify(results)
 
 @app.route("/api/trending")
 def api_trending():
