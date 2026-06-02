@@ -391,7 +391,6 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MemePhase — Meme Coin Lifecycle Tracker</title>
-<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root,[data-theme="dark"]{
   --bg:#0d0d1a;--card:#14142b;--card2:#1a1a30;--border:#2a2a4a;
@@ -455,8 +454,11 @@ header{background:linear-gradient(135deg,#1a0533,#0d1a33);padding:14px 20px;bord
 .tf-btn{background:var(--card2);border:1px solid var(--border);color:var(--sub);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:500;transition:all var(--trans)}
 .tf-btn:hover{color:var(--text)}
 .tf-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
-#priceChart{width:100%;height:320px;border-radius:8px;overflow:hidden}
+#priceChart{width:100%;height:520px;border-radius:8px;overflow:hidden;background:var(--card2)}
 .dex-embed{width:100%;height:100%;border:0;background:var(--card2)}
+.tv-chart{width:100%;height:100%}
+.tv-chart .tradingview-widget-container{height:100%;width:100%}
+.tv-chart .tradingview-widget-container__widget{height:100%;width:100%}
 .chart-note{font-size:10px;color:var(--sub);margin-top:6px;text-align:center}
 .trending-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
 .trending-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;cursor:pointer;transition:all var(--trans);display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -559,6 +561,7 @@ themeBtn.addEventListener('click', () => {
   document.documentElement.setAttribute('data-theme', theme);
   themeBtn.textContent = theme === 'dark' ? '☀️' : '🌙';
   if (currentChart) updateChartTheme();
+  else if (currentPairAddr) loadChart(currentTF);
 });
 
 // ── TABS ───────────────────────────────────
@@ -576,7 +579,7 @@ function switchTab(id) {
 }
 
 // ── CHART ──────────────────────────────────
-let currentChart = null, currentPairAddr = null, currentChainId = null, currentCgId = null, currentChartSource = null, currentTF = '15m';
+let currentChart = null, currentPairAddr = null, currentChainId = null, currentCgId = null, currentChartSource = null, currentSymbol = null, currentName = null, currentTF = '15m';
 
 const TF_PARAMS = {
   '5m':  {tf:'minute', agg:5,  limit:300, interval:'5m',  visible:60},
@@ -685,6 +688,100 @@ async function loadChart(tfKey) {
 }
 
 // ── HELPERS ────────────────────────────────
+const EMBED_TF = {
+  '5m':  {tv:'5', dex:'5'},
+  '15m': {tv:'15', dex:'15'},
+  '1H':  {tv:'60', dex:'60'},
+  '4H':  {tv:'240', dex:'240'},
+  '1D':  {tv:'D', dex:'D'},
+};
+
+const TV_SYMBOLS = {
+  BTC:'BINANCE:BTCUSDT', WBTC:'BINANCE:BTCUSDT',
+  ETH:'BINANCE:ETHUSDT', SOL:'BINANCE:SOLUSDT', BNB:'BINANCE:BNBUSDT',
+  XRP:'BINANCE:XRPUSDT', DOGE:'BINANCE:DOGEUSDT', ADA:'BINANCE:ADAUSDT',
+  AVAX:'BINANCE:AVAXUSDT', LINK:'BINANCE:LINKUSDT', DOT:'BINANCE:DOTUSDT',
+  TRX:'BINANCE:TRXUSDT', TON:'BINANCE:TONUSDT', LTC:'BINANCE:LTCUSDT',
+  BCH:'BINANCE:BCHUSDT', UNI:'BINANCE:UNIUSDT', AAVE:'BINANCE:AAVEUSDT',
+  SUI:'BINANCE:SUIUSDT', HBAR:'BINANCE:HBARUSDT', XLM:'BINANCE:XLMUSDT',
+  FIL:'BINANCE:FILUSDT', NEAR:'BINANCE:NEARUSDT', INJ:'BINANCE:INJUSDT',
+  SEI:'BINANCE:SEIUSDT', OP:'BINANCE:OPUSDT', ARB:'BINANCE:ARBUSDT',
+  PEPE:'BINANCE:PEPEUSDT', SHIB:'BINANCE:SHIBUSDT', BONK:'BINANCE:BONKUSDT',
+  WIF:'BINANCE:WIFUSDT', FLOKI:'BINANCE:FLOKIUSDT'
+};
+
+function setChartNote(text) {
+  const note = document.getElementById('chartNote');
+  if (note) note.textContent = text;
+}
+
+function currentTradingViewSymbol() {
+  return TV_SYMBOLS[String(currentSymbol||'').toUpperCase()] || null;
+}
+
+function renderTradingViewChart(tvSymbol, tfKey) {
+  const chartEl = document.getElementById('priceChart');
+  if (!chartEl) return;
+  const p = EMBED_TF[tfKey] || EMBED_TF['15m'];
+  chartEl.innerHTML = '<div class="tv-chart"><div class="tradingview-widget-container"><div class="tradingview-widget-container__widget"></div></div></div>';
+  const container = chartEl.querySelector('.tradingview-widget-container');
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  script.text = JSON.stringify({
+    autosize:true,
+    symbol:tvSymbol,
+    interval:p.tv,
+    timezone:'Etc/UTC',
+    theme:theme === 'dark' ? 'dark' : 'light',
+    style:'1',
+    locale:'en',
+    hide_side_toolbar:false,
+    hide_top_toolbar:false,
+    allow_symbol_change:true,
+    save_image:false,
+    calendar:false,
+    details:false,
+    hotlist:false,
+    withdateranges:true,
+    hide_volume:false,
+    backgroundColor:theme === 'dark' ? '#14142b' : '#ffffff',
+    gridColor:theme === 'dark' ? 'rgba(136,136,170,0.18)' : 'rgba(102,102,136,0.18)'
+  });
+  container.appendChild(script);
+  currentChart = null;
+  setChartNote(`TradingView chart · ${tvSymbol}`);
+}
+
+function renderDexScreenerChart(tfKey) {
+  const chartEl = document.getElementById('priceChart');
+  if (!chartEl || !currentPairAddr || !currentChainId) return;
+  const p = EMBED_TF[tfKey] || EMBED_TF['15m'];
+  const params = new URLSearchParams({
+    embed:'1',
+    loadChartSettings:'0',
+    chartLeftToolbar:'1',
+    chartTheme:theme,
+    theme:theme,
+    chartStyle:'1',
+    chartType:'usd',
+    interval:p.dex,
+  });
+  const src = `https://dexscreener.com/${encodeURIComponent(currentChainId)}/${encodeURIComponent(currentPairAddr)}?${params.toString()}`;
+  chartEl.innerHTML = `<iframe class="dex-embed" src="${src}" title="DexScreener chart" loading="lazy"></iframe>`;
+  currentChart = null;
+  setChartNote('DexScreener chart · exact DEX pair');
+}
+
+async function loadChart(tfKey) {
+  currentTF = tfKey;
+  document.querySelectorAll('.tf-btn').forEach(b => b.classList.toggle('active', b.dataset.tf===tfKey));
+  const tvSymbol = currentTradingViewSymbol();
+  if (tvSymbol) renderTradingViewChart(tvSymbol, tfKey);
+  else renderDexScreenerChart(tfKey);
+}
+
 const fmt = n => !n ? '0' : n>1e9?(n/1e9).toFixed(2)+'B':n>1e6?(n/1e6).toFixed(2)+'M':n>1e3?(n/1e3).toFixed(1)+'K':n.toLocaleString();
 const fmtP = p => {
   const f = parseFloat(p||0);
@@ -800,6 +897,8 @@ function renderAnalysis(d) {
   currentChainId  = p.chainId;
   currentCgId     = p.cgId || null;
   currentChartSource = p.chartSource || null;
+  currentSymbol   = (p.baseToken || {}).symbol || null;
+  currentName     = (p.baseToken || {}).name || null;
   currentChart    = null;
   const pc24Raw=(p.priceChange||{}).h24;
   const hasPc24=pc24Raw!==undefined && pc24Raw!==null && pc24Raw!=='';
@@ -848,7 +947,7 @@ function renderAnalysis(d) {
         </div>
       </div>
       <div id="priceChart"></div>
-      <div class="chart-note">Scroll to zoom · Drag to pan · Data: ${p.chartSource==='coingecko'?'CoinGecko':'GeckoTerminal'} with DexScreener fallback</div>
+      <div class="chart-note" id="chartNote">Chart loading...</div>
     </div>
 
     <div class="card">
