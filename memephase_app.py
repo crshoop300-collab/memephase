@@ -12,6 +12,7 @@ app = Flask(__name__)
 DEXSCREENER_BASE  = "https://api.dexscreener.com"
 COINGECKO_BASE    = "https://api.coingecko.com/api/v3"
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
+STAGE_CACHE = {"date": None, "data": None}
 
 # Chain ID mapping dexscreener -> geckoterminal network slug
 CHAIN_MAP = {
@@ -30,6 +31,82 @@ def fetch_dex_search(query):
         return pairs[0]
     except Exception as e:
         print(f"DexSearch err: {e}"); return None
+
+def fetch_dex_json(path):
+    try:
+        r = requests.get(f"{DEXSCREENER_BASE}{path}", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"Dex endpoint err {path}: {e}"); return None
+
+def fetch_token_pairs(chain_id, token_address):
+    if not chain_id or not token_address:
+        return []
+    raw = fetch_dex_json(f"/token-pairs/v1/{chain_id}/{token_address}") or []
+    pairs = raw if isinstance(raw, list) else raw.get("pairs", [])
+    pairs = [p for p in pairs if p and p.get("pairAddress")]
+    pairs.sort(key=lambda p: (
+        safe_float((p.get("liquidity") or {}).get("usd")),
+        safe_float((p.get("volume") or {}).get("h24")),
+    ), reverse=True)
+    return pairs
+
+def serialize_analysis(pair, cg_data=None, cg_id=None):
+    pair = merge_coingecko_market_data(pair, cg_data, cg_id)
+    lc = compute_lifecycle(pair, cg_data)
+    cp = {k:pair.get(k) for k in ["baseToken","quoteToken","chainId","dexId","pairAddress",
+          "priceUsd","priceChange","volume","liquidity","marketCap","fdv","txns","pairCreatedAt",
+          "cgId","marketDataSource","chartSource"]}
+    return {"pair": cp, "lifecycle": lc}
+
+def discover_stage_tokens(force=False):
+    today = time.strftime("%Y-%m-%d")
+    if not force and STAGE_CACHE["date"] == today and STAGE_CACHE["data"]:
+        return STAGE_CACHE["data"]
+
+    sources = []
+    for path in ["/token-profiles/latest/v1", "/token-boosts/latest/v1", "/token-boosts/top/v1"]:
+        raw = fetch_dex_json(path) or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        sources.extend(raw[:40])
+
+    seen_tokens, candidates = set(), []
+    for item in sources:
+        chain = item.get("chainId")
+        token = item.get("tokenAddress")
+        if not chain or not token:
+            continue
+        key = f"{chain}:{token}".lower()
+        if key in seen_tokens:
+            continue
+        seen_tokens.add(key)
+        candidates.append((chain, token))
+        if len(candidates) >= 120:
+            break
+
+    stages = {"sprout": [], "expansion": [], "peak": [], "cooling": []}
+    seen_pairs = set()
+    for chain, token in candidates:
+        if all(len(v) >= 10 for v in stages.values()):
+            break
+        pairs = fetch_token_pairs(chain, token)
+        if not pairs:
+            continue
+        pair = pairs[0]
+        pair_key = f"{pair.get('chainId')}:{pair.get('pairAddress')}".lower()
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        analysis = serialize_analysis(pair)
+        stage_key = {0:"sprout", 1:"sprout", 2:"expansion", 3:"peak", 4:"cooling"}.get(analysis["lifecycle"]["stage_id"])
+        if stage_key and len(stages[stage_key]) < 10:
+            stages[stage_key].append(analysis)
+
+    payload = {"generated_at": int(time.time()), "stages": stages}
+    STAGE_CACHE.update({"date": today, "data": payload})
+    return payload
 
 def fetch_geckoterminal_ohlcv(network, pool_address, timeframe="minute", aggregate=15, limit=300):
     """
@@ -106,6 +183,140 @@ def fetch_coingecko_coin(coin_id):
         return r.json()
     except: return None
 
+def fetch_coingecko_match(query, pair=None):
+    try:
+        r = requests.get(f"{COINGECKO_BASE}/search", params={"query": query}, timeout=8)
+        r.raise_for_status()
+        coins = r.json().get("coins", [])
+        if not coins: return None
+        q = (query or "").strip().lower()
+        sym = ((pair or {}).get("baseToken") or {}).get("symbol", "").strip().lower()
+        for c in coins:
+            if c.get("id", "").lower() == q or c.get("name", "").lower() == q:
+                return c
+        for c in coins:
+            if c.get("symbol", "").lower() in {q, sym}:
+                return c
+        return coins[0]
+    except Exception as e:
+        print(f"CG search err: {e}"); return None
+
+def interval_seconds(interval_key):
+    return {"5m":300, "15m":900, "1H":3600, "4H":14400, "1D":86400}.get(interval_key, 3600)
+
+def coingecko_history_days(interval_key):
+    return {"5m":"1", "15m":"1", "1H":"7", "4H":"30", "1D":"365"}.get(interval_key, "30")
+
+def coingecko_ohlc_candles(coin_id, interval_key=None):
+    days = coingecko_history_days(interval_key)
+    try:
+        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
+                         params={"vs_currency": "usd", "days": days}, timeout=10)
+        r.raise_for_status()
+        candles = []
+        for c in r.json():
+            ts = int(c[0] // 1000)
+            candles.append({"time": ts, "open": float(c[1]), "high": float(c[2]),
+                            "low": float(c[3]), "close": float(c[4])})
+        return candles
+    except Exception as e:
+        print(f"CG OHLC err: {e}"); return []
+
+def coingecko_price_points(coin_id, timeframe="hour", aggregate=4, interval_key=None):
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": coingecko_history_days(interval_key)}
+    if interval_key == "1D":
+        params["interval"] = "daily"
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        prices = r.json().get("prices", [])
+        points, seen = [], set()
+        step = max(1, int(aggregate or 1)) if timeframe == "hour" else 1
+        last_bucket = None
+        for ts_ms, price in prices:
+            ts = int(ts_ms // 1000)
+            if timeframe == "hour":
+                bucket = ts // (step * 3600)
+                if bucket == last_bucket:
+                    continue
+                last_bucket = bucket
+            if ts not in seen:
+                seen.add(ts)
+                points.append({"time": ts, "value": float(price)})
+        return points
+    except Exception as e:
+        print(f"CG chart err: {e}"); return []
+
+def price_points_to_candles(points, interval_key=None):
+    if not points:
+        return []
+    bucket_seconds = interval_seconds(interval_key)
+    buckets = {}
+    for p in points:
+        bucket = int(p["time"] // bucket_seconds) * bucket_seconds
+        buckets.setdefault(bucket, []).append(p)
+    candles = []
+    prev_close = None
+    for bucket in sorted(buckets):
+        vals = buckets[bucket]
+        prices = [float(v["value"]) for v in vals]
+        open_price = prev_close if len(prices) == 1 and prev_close is not None else prices[0]
+        close_price = prices[-1]
+        high_price = max(max(prices), open_price, close_price)
+        low_price = min(min(prices), open_price, close_price)
+        candles.append({"time": bucket, "open": open_price, "high": high_price,
+                        "low": low_price, "close": close_price})
+        prev_close = close_price
+    return candles
+
+def coingecko_candles(coin_id, timeframe="hour", aggregate=4, interval_key=None):
+    candles = price_points_to_candles(coingecko_price_points(coin_id, timeframe, aggregate, interval_key), interval_key)
+    if candles:
+        return candles
+    return coingecko_ohlc_candles(coin_id, interval_key)
+
+
+def merge_coingecko_market_data(pair, cg_data, cg_id=None):
+    if not cg_data:
+        return pair
+    md = cg_data.get("market_data") or {}
+    p = dict(pair)
+    p["cgId"] = cg_id or cg_data.get("id")
+    p["chartSource"] = "geckoterminal"
+    used_cg = False
+
+    price = (md.get("current_price") or {}).get("usd")
+    if price:
+        p["priceUsd"] = str(price)
+        used_cg = True
+
+    pc24 = md.get("price_change_percentage_24h")
+    price_change = dict(p.get("priceChange") or {})
+    if pc24 is not None and (not price_change.get("h24") or abs(safe_float(price_change.get("h24"))) < 0.0001):
+        price_change["h24"] = pc24
+        used_cg = True
+    p["priceChange"] = price_change
+
+    volume = dict(p.get("volume") or {})
+    cg_vol = (md.get("total_volume") or {}).get("usd")
+    if cg_vol and safe_float(volume.get("h24")) < 1000:
+        volume["h24"] = cg_vol
+        used_cg = True
+    p["volume"] = volume
+
+    market_cap = (md.get("market_cap") or {}).get("usd")
+    if market_cap and not safe_float(p.get("marketCap")):
+        p["marketCap"] = market_cap
+        used_cg = True
+    elif market_cap and safe_float(volume.get("h24")) >= 1000 and safe_float(p.get("volume", {}).get("h24")) == safe_float(cg_vol):
+        p["marketCap"] = market_cap
+
+    if used_cg:
+        p["marketDataSource"] = "coingecko"
+        p["chartSource"] = "coingecko"
+    return p
+
 def safe_float(val, default=0.0):
     try: return float(val) if val is not None else default
     except: return default
@@ -170,7 +381,7 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MemePhase — Meme Coin Lifecycle Tracker</title>
-<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root,[data-theme="dark"]{
   --bg:#0d0d1a;--card:#14142b;--card2:#1a1a30;--border:#2a2a4a;
@@ -354,14 +565,14 @@ function switchTab(id) {
 }
 
 // ── CHART ──────────────────────────────────
-let currentChart = null, currentPairAddr = null, currentChainId = null, currentTF = '15m';
+let currentChart = null, currentPairAddr = null, currentChainId = null, currentCgId = null, currentChartSource = null, currentTF = '15m';
 
 const TF_PARAMS = {
-  '5m':  {tf:'minute', agg:5},
-  '15m': {tf:'minute', agg:15},
-  '1H':  {tf:'hour',   agg:1},
-  '4H':  {tf:'hour',   agg:4},
-  '1D':  {tf:'day',    agg:1},
+  '5m':  {tf:'minute', agg:5,  limit:300, interval:'5m',  visible:60},
+  '15m': {tf:'minute', agg:15, limit:300, interval:'15m', visible:80},
+  '1H':  {tf:'hour',   agg:1,  limit:300, interval:'1H',  visible:100},
+  '4H':  {tf:'hour',   agg:4,  limit:300, interval:'4H',  visible:100},
+  '1D':  {tf:'day',    agg:1,  limit:365, interval:'1D',  visible:90},
 };
 
 function chartColors() {
@@ -374,18 +585,33 @@ function initChart() {
   const c = chartColors();
   const el = document.getElementById('priceChart');
   if (!el) return null;
+  el.innerHTML = '';
   const chart = LightweightCharts.createChart(el, {
     width: el.offsetWidth, height: 320,
     layout: {background:{color:c.bg}, textColor:c.text},
     grid: {vertLines:{color:c.grid}, horzLines:{color:c.grid}},
     crosshair: {mode: LightweightCharts.CrosshairMode.Normal},
     rightPriceScale: {borderColor:c.grid, scaleMargins:{top:0.1,bottom:0.1}},
-    timeScale: {borderColor:c.grid, timeVisible:true, secondsVisible:false},
-    handleScroll:true, handleScale:true,
+    timeScale: {
+      borderColor:c.grid,
+      timeVisible:true,
+      secondsVisible:false,
+      rightOffset:6,
+      barSpacing:12,
+      fixLeftEdge:false,
+      fixRightEdge:false,
+      lockVisibleTimeRangeOnResize:false,
+      shiftVisibleRangeOnNewBar:false,
+    },
+    handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false},
+    handleScale:{axisPressedMouseMove:true,mouseWheel:true,pinch:true},
   });
-  const series = chart.addCandlestickSeries({
+  const seriesOptions = {
     upColor:c.up, downColor:c.dn, borderUpColor:c.up, borderDownColor:c.dn, wickUpColor:c.up, wickDownColor:c.dn,
-  });
+  };
+  const series = chart.addCandlestickSeries
+    ? chart.addCandlestickSeries(seriesOptions)
+    : chart.addSeries(LightweightCharts.CandlestickSeries, seriesOptions);
   window.addEventListener('resize', () => {
     const e = document.getElementById('priceChart');
     if (e) chart.applyOptions({width: e.offsetWidth});
@@ -412,9 +638,14 @@ async function loadChart(tfKey) {
   if (!chartEl) return;
   const p = TF_PARAMS[tfKey];
   try {
-    const r = await fetch(`/api/ohlcv?pair=${currentPairAddr}&chain=${currentChainId||'solana'}&tf=${p.tf}&agg=${p.agg}`);
+    const cgPart = currentCgId ? `&cg=${encodeURIComponent(currentCgId)}` : '';
+    const sourcePart = currentChartSource ? `&source=${encodeURIComponent(currentChartSource)}` : '';
+    const limitPart = p.limit ? `&limit=${p.limit}` : '';
+    const intervalPart = p.interval ? `&interval=${encodeURIComponent(p.interval)}` : '';
+    const r = await fetch(`/api/ohlcv?pair=${currentPairAddr}&chain=${currentChainId||'solana'}&tf=${p.tf}&agg=${p.agg}${limitPart}${intervalPart}${cgPart}${sourcePart}`);
     const data = await r.json();
-    if (!data.candles || data.candles.length === 0) {
+    const candles = data.candles || [];
+    if (!candles || candles.length === 0) {
       chartEl.innerHTML = `<div style="padding:40px;text-align:center;color:var(--sub);font-size:13px">
         📊 No chart data for this timeframe.<br>
         <span style="font-size:11px;display:block;margin-top:6px">Try a longer timeframe (1H or 1D) — very new tokens may only have daily data.</span>
@@ -424,8 +655,14 @@ async function loadChart(tfKey) {
     }
     if (!currentChart) { currentChart = initChart(); }
     if (!currentChart) return;
-    currentChart.series.setData(data.candles);
-    currentChart.chart.timeScale().fitContent();
+    currentChart.series.setData(candles);
+    const visibleBars = Math.min(candles.length, p.visible || 80);
+    if (candles.length > visibleBars) {
+      currentChart.chart.timeScale().setVisibleLogicalRange({from:candles.length-visibleBars, to:candles.length+4});
+    } else {
+      currentChart.chart.timeScale().fitContent();
+      currentChart.chart.timeScale().scrollToPosition(4, false);
+    }
   } catch(e) {
     console.error('Chart err:', e);
     if (chartEl) chartEl.innerHTML = '<div style="padding:40px;text-align:center;color:var(--sub)">Chart unavailable.</div>';
@@ -434,7 +671,13 @@ async function loadChart(tfKey) {
 
 // ── HELPERS ────────────────────────────────
 const fmt = n => !n ? '0' : n>1e9?(n/1e9).toFixed(2)+'B':n>1e6?(n/1e6).toFixed(2)+'M':n>1e3?(n/1e3).toFixed(1)+'K':n.toLocaleString();
-const fmtP = p => { const f=parseFloat(p||0); return f===0?'—':f<0.000001?f.toExponential(4):f<0.01?f.toFixed(8):f<1?f.toFixed(5):f.toFixed(4); };
+const fmtP = p => {
+  const f = parseFloat(p||0);
+  if (!Number.isFinite(f) || f===0) return '—';
+  if (Math.abs(f) >= 1) return f.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  return f<0.000001?f.toExponential(4):f<0.01?f.toFixed(8):f.toFixed(5);
+};
+const jsArg = v => String(v??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,' ');
 const scCol = s => s>=70?'#10b981':s>=50?'#f59e0b':'#ef4444';
 const fomoCol= s => s>=75?'#ef4444':s>=50?'#f59e0b':s>=25?'#10b981':'#06b6d4';
 const STAGES=['🥚 Launch','🌱 Sprout','🚀 Expansion','📈 Peak Hype','📉 Cooling','💀 Decline'];
@@ -445,7 +688,7 @@ function lcBar(ai) { return STAGES.map((s,i)=>`<div class="lc-seg${i===ai?' acti
 function miniBar(ai){ return STAGES.map((s,i)=>`<div class="mini-seg${i===ai?' active':''}" style="background:${SCOLS[i]}"></div>`).join(''); }
 
 // ── STAGE TABS ─────────────────────────────
-const STAB = {1:'sprout',2:'expansion',3:'peak',4:'cooling'};
+const STAB = {0:'sprout',1:'sprout',2:'expansion',3:'peak',4:'cooling'};
 const stageLists = {sprout:[],expansion:[],peak:[],cooling:[]};
 const STAGEINFO = {
   sprout:   {icon:'🌱',title:'Sprout Stage',desc:'Early momentum. High risk, high upside.',col:'#27ae60'},
@@ -469,14 +712,15 @@ function renderStageTab(key) {
   const el = document.getElementById(key+'Content');
   if (!el) return;
   if (!list.length) {
-    el.innerHTML=`<div class="empty"><div class="empty-icon">${s.icon}</div><div>No ${s.title} coins yet. Analyze tokens above.</div></div>`;
+    el.innerHTML=`<div class="empty"><div class="empty-icon">${s.icon}</div><div>No fresh ${s.title} coins found yet.</div></div>`;
     return;
   }
   const cards = list.map(d => {
     const p=d.pair, lc=d.lifecycle;
     const pc24=parseFloat((p.priceChange||{}).h24||0);
     const mc=parseInt(p.marketCap||p.fdv||0);
-    return `<div class="mini-card" onclick="analyzeFull('${p.baseToken.symbol}')">
+    const q=(p.baseToken||{}).address||p.pairAddress||p.baseToken.symbol;
+    return `<div class="mini-card" onclick="analyzeFull('${jsArg(q)}')">
       <div class="mini-top">
         <div><div class="mini-name">${p.baseToken.name}</div><div class="mini-sym">${p.baseToken.symbol} · ${p.chainId}</div></div>
         <div class="mini-score" style="color:${lc.stage_color}">${lc.composite_score}</div>
@@ -493,6 +737,25 @@ function renderStageTab(key) {
 }
 
 // ── ANALYZE ────────────────────────────────
+async function loadLifecycleStages(refresh=false) {
+  ['sprout','expansion','peak','cooling'].forEach(k => {
+    const el=document.getElementById(k+'Content');
+    if (el) el.innerHTML='<div class="loading"><div class="spinner"></div><div>Finding fresh coins...</div></div>';
+  });
+  try {
+    const data = await fetch(`/api/stages${refresh?'?refresh=1':''}`).then(r=>r.json());
+    ['sprout','expansion','peak','cooling'].forEach(k => {
+      stageLists[k] = (data.stages && data.stages[k]) || [];
+      renderStageTab(k);
+    });
+  } catch(e) {
+    ['sprout','expansion','peak','cooling'].forEach(k => {
+      const s=STAGEINFO[k], el=document.getElementById(k+'Content');
+      if (el) el.innerHTML=`<div class="empty"><div class="empty-icon">${s.icon}</div><div style="color:#ef4444">Could not load fresh ${s.title} coins.</div></div>`;
+    });
+  }
+}
+
 async function doAnalyze() {
   const q = document.getElementById('tokenInput').value.trim();
   if (!q) return;
@@ -520,10 +783,14 @@ function renderAnalysis(d) {
   const p=d.pair, lc=d.lifecycle;
   currentPairAddr = p.pairAddress;
   currentChainId  = p.chainId;
+  currentCgId     = p.cgId || null;
+  currentChartSource = p.chartSource || null;
   currentChart    = null;
-  const pc24=parseFloat((p.priceChange||{}).h24||0);
+  const pc24Raw=(p.priceChange||{}).h24;
+  const hasPc24=pc24Raw!==undefined && pc24Raw!==null && pc24Raw!=='';
+  const pc24=parseFloat(pc24Raw||0);
   const pcClass=pc24>=0?'positive':'negative';
-  const pcStr=(pc24>=0?'+':'')+pc24.toFixed(2)+'%';
+  const pcStr=hasPc24?(pc24>=0?'+':'')+pc24.toFixed(2)+'%':'—';
   const mc=parseInt(p.marketCap||p.fdv||0);
   const vol=parseInt((p.volume||{}).h24||0);
   const liq=parseInt((p.liquidity||{}).usd||0);
@@ -566,7 +833,7 @@ function renderAnalysis(d) {
         </div>
       </div>
       <div id="priceChart"></div>
-      <div class="chart-note">Scroll to zoom · Drag to pan · Powered by GeckoTerminal</div>
+      <div class="chart-note">Scroll to zoom · Drag to pan · Powered by ${p.chartSource==='coingecko'?'CoinGecko':'GeckoTerminal'}</div>
     </div>
 
     <div class="card">
@@ -643,6 +910,7 @@ async function loadTrending() {
   }
 }
 
+loadLifecycleStages();
 loadTrending();
 </script>
 </body>
@@ -658,18 +926,14 @@ def api_analyze():
     if not q: return jsonify({"error":"No query"}),400
     pair = fetch_dex_search(q)
     if not pair: return jsonify({"error":f"No token found for '{q}'. Try the contract address."}),404
-    cg_data = None
+    cg_data, cg_id = None, None
     try:
-        sym=(pair.get("baseToken") or {}).get("symbol","").lower()
-        cs=requests.get(f"{COINGECKO_BASE}/search?query={sym}",timeout=5)
-        if cs.ok:
-            cgs=cs.json().get("coins",[])
-            if cgs: cg_data=fetch_coingecko_coin(cgs[0]["id"])
+        cg_match = fetch_coingecko_match(q, pair)
+        if cg_match:
+            cg_id = cg_match.get("id")
+            cg_data = fetch_coingecko_coin(cg_id)
     except: pass
-    lc = compute_lifecycle(pair, cg_data)
-    cp = {k:pair.get(k) for k in ["baseToken","quoteToken","chainId","dexId","pairAddress",
-          "priceUsd","priceChange","volume","liquidity","marketCap","fdv","txns","pairCreatedAt"]}
-    return jsonify({"pair":cp,"lifecycle":lc})
+    return jsonify(serialize_analysis(pair, cg_data, cg_id))
 
 @app.route("/api/ohlcv")
 def api_ohlcv():
@@ -677,16 +941,28 @@ def api_ohlcv():
     chain     = request.args.get("chain","solana").strip()
     tf        = request.args.get("tf","minute").strip()
     agg       = request.args.get("agg","15").strip()
+    limit     = request.args.get("limit","300").strip()
+    interval_key = request.args.get("interval","").strip() or request.args.get("range","").strip()
+    cg_id     = request.args.get("cg","").strip()
+    source    = request.args.get("source","").strip()
     if not pair_addr: return jsonify({"error":"No pair","candles":[]}),400
+    if cg_id and source == "coingecko":
+        candles = coingecko_candles(cg_id, tf, agg, interval_key)
+        if candles:
+            return jsonify({"candles": candles, "source": "coingecko"})
     network = CHAIN_MAP.get(chain, chain)
     # Try GeckoTerminal
-    candles = fetch_geckoterminal_ohlcv(network, pair_addr, tf, agg)
+    candles = fetch_geckoterminal_ohlcv(network, pair_addr, tf, agg, limit)
     if candles:
         return jsonify({"candles": candles, "source": "geckoterminal"})
     # Fallback: try alternate GT URL format
-    candles = fetch_geckoterminal_ohlcv_v2(network, pair_addr, tf, agg)
+    candles = fetch_geckoterminal_ohlcv_v2(network, pair_addr, tf, agg, limit)
     if candles:
         return jsonify({"candles": candles, "source": "geckoterminal_v2"})
+    if cg_id:
+        candles = coingecko_candles(cg_id, tf, agg, interval_key)
+        if candles:
+            return jsonify({"candles": candles, "source": "coingecko"})
     return jsonify({"candles": [], "error": "No chart data available"})
 
 @app.route("/api/debug")
@@ -707,6 +983,11 @@ def api_debug():
 @app.route("/api/trending")
 def api_trending():
     return jsonify(fetch_trending_coingecko())
+
+@app.route("/api/stages")
+def api_stages():
+    force = request.args.get("refresh") == "1"
+    return jsonify(discover_stage_tokens(force=force))
 
 if __name__ == "__main__":
     import os
