@@ -426,7 +426,15 @@ header{background:linear-gradient(135deg,#1a0533,#0d1a33);padding:14px 20px;bord
 .tab-pane{display:none;padding:20px;max-width:1400px;margin:0 auto}
 .tab-pane.active{display:block}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:800px){.grid{grid-template-columns:1fr}}
+.analysis-grid{grid-template-columns:minmax(280px,1fr) minmax(380px,1fr);align-items:stretch}
+.analysis-grid .card,.analysis-grid .chart-container{min-width:0}
+.token-summary{order:1}
+.lifecycle-card{order:2}
+.fomo-card{order:3}
+.market-card{order:4}
+.breakdown-card{order:5}
+.analysis-grid>.chart-container{order:6}
+@media(max-width:900px){.grid,.analysis-grid{grid-template-columns:1fr}}
 .full{grid-column:1/-1}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
 .card-title{font-size:11px;font-weight:600;color:var(--sub);text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px}
@@ -490,6 +498,8 @@ header{background:linear-gradient(135deg,#1a0533,#0d1a33);padding:14px 20px;bord
 @keyframes spin{to{transform:rotate(360deg)}}
 .alert{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:8px 12px;font-size:11px;color:var(--yellow);margin-top:10px}
 .token-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.token-summary{min-height:208px;display:flex;align-items:center}
+.token-summary .token-header{width:100%}
 .t-name-big{font-size:20px;font-weight:800}
 .t-meta{font-size:11px;color:var(--sub);margin-top:2px}
 .price-usd{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums}
@@ -920,8 +930,8 @@ function renderAnalysis(d) {
     </div>`).join('');
 
   document.getElementById('analyzeContent').innerHTML=`
-  <div class="grid">
-    <div class="card full">
+  <div class="grid analysis-grid">
+    <div class="card token-summary">
       <div class="token-header">
         <div>
           <div class="t-name-big">${p.baseToken.name} <span style="color:var(--sub);font-size:14px">${p.baseToken.symbol}</span></div>
@@ -950,7 +960,7 @@ function renderAnalysis(d) {
       <div class="chart-note" id="chartNote">Chart loading...</div>
     </div>
 
-    <div class="card">
+    <div class="card lifecycle-card">
       <div class="card-title">Lifecycle Stage</div>
       <div class="stage-badge" style="background:${lc.stage_color}22;color:${lc.stage_color};border:1px solid ${lc.stage_color}44">${lc.stage}</div>
       <div style="font-size:30px;font-weight:900;color:${lc.stage_color}">${lc.composite_score}/100</div>
@@ -958,7 +968,7 @@ function renderAnalysis(d) {
       <div class="lifecycle-bar">${lcBar(lc.stage_id)}</div>
     </div>
 
-    <div class="card">
+    <div class="card fomo-card">
       <div class="card-title">FOMO Risk Score</div>
       <div class="fomo-number" style="color:${fomoCol(lc.fomo_risk)}">${lc.fomo_risk}</div>
       <div class="fomo-label">out of 100</div>
@@ -970,7 +980,7 @@ function renderAnalysis(d) {
       </div>
     </div>
 
-    <div class="card">
+    <div class="card market-card">
       <div class="card-title">Market Data</div>
       <div class="info-grid">
         <div class="info-item"><div class="lbl">Market Cap</div><div class="val">$${fmt(mc)}</div></div>
@@ -987,7 +997,7 @@ function renderAnalysis(d) {
       <div class="alert">⚠️ Not financial advice. Meme coins are extremely high risk. Always DYOR.</div>
     </div>
 
-    <div class="card full">
+    <div class="card full breakdown-card">
       <div class="card-title">Lifecycle Signal Breakdown</div>
       ${scoresHtml}
     </div>
@@ -1110,5 +1120,5 @@ def api_stages():
 
 if __name__ == "__main__":
     import os
-    print("\n🪙 MemePhase v3 running at http://localhost:5000")
+    print("\nMemePhase v3 running at http://localhost:5000")
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
