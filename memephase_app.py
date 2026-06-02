@@ -57,7 +57,7 @@ def serialize_analysis(pair, cg_data=None, cg_id=None):
     lc = compute_lifecycle(pair, cg_data)
     cp = {k:pair.get(k) for k in ["baseToken","quoteToken","chainId","dexId","pairAddress",
           "priceUsd","priceChange","volume","liquidity","marketCap","fdv","txns","pairCreatedAt",
-          "cgId","marketDataSource","chartSource"]}
+          "cgId","marketDataSource","chartSource","url"]}
     return {"pair": cp, "lifecycle": lc}
 
 def discover_stage_tokens(force=False):
@@ -276,6 +276,16 @@ def coingecko_candles(coin_id, timeframe="hour", aggregate=4, interval_key=None)
         return candles
     return coingecko_ohlc_candles(coin_id, interval_key)
 
+def dexscreener_embed_url(chain, pair_addr, interval_key="15m"):
+    if not chain or not pair_addr:
+        return None
+    interval = {"5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D"}.get(interval_key, "15")
+    params = (
+        "embed=1&loadChartSettings=0&chartLeftToolbar=0"
+        f"&chartTheme=dark&theme=dark&chartStyle=1&chartType=usd&interval={interval}"
+    )
+    return f"https://dexscreener.com/{chain}/{pair_addr}?{params}"
+
 
 def merge_coingecko_market_data(pair, cg_data, cg_id=None):
     if not cg_data:
@@ -446,6 +456,7 @@ header{background:linear-gradient(135deg,#1a0533,#0d1a33);padding:14px 20px;bord
 .tf-btn:hover{color:var(--text)}
 .tf-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
 #priceChart{width:100%;height:320px;border-radius:8px;overflow:hidden}
+.dex-embed{width:100%;height:100%;border:0;background:var(--card2)}
 .chart-note{font-size:10px;color:var(--sub);margin-top:6px;text-align:center}
 .trending-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
 .trending-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;cursor:pointer;transition:all var(--trans);display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -646,6 +657,10 @@ async function loadChart(tfKey) {
     const data = await r.json();
     const candles = data.candles || [];
     if (!candles || candles.length === 0) {
+      if (data.embed_url) {
+        chartEl.innerHTML = `<iframe class="dex-embed" src="${data.embed_url}" title="DexScreener chart" loading="lazy"></iframe>`;
+        currentChart = null; return;
+      }
       chartEl.innerHTML = `<div style="padding:40px;text-align:center;color:var(--sub);font-size:13px">
         📊 No chart data for this timeframe.<br>
         <span style="font-size:11px;display:block;margin-top:6px">Try a longer timeframe (1H or 1D) — very new tokens may only have daily data.</span>
@@ -833,7 +848,7 @@ function renderAnalysis(d) {
         </div>
       </div>
       <div id="priceChart"></div>
-      <div class="chart-note">Scroll to zoom · Drag to pan · Powered by ${p.chartSource==='coingecko'?'CoinGecko':'GeckoTerminal'}</div>
+      <div class="chart-note">Scroll to zoom · Drag to pan · Data: ${p.chartSource==='coingecko'?'CoinGecko':'GeckoTerminal'} with DexScreener fallback</div>
     </div>
 
     <div class="card">
@@ -963,7 +978,12 @@ def api_ohlcv():
         candles = coingecko_candles(cg_id, tf, agg, interval_key)
         if candles:
             return jsonify({"candles": candles, "source": "coingecko"})
-    return jsonify({"candles": [], "error": "No chart data available"})
+    return jsonify({
+        "candles": [],
+        "error": "No OHLCV data available from GeckoTerminal or CoinGecko",
+        "embed_url": dexscreener_embed_url(chain, pair_addr, interval_key),
+        "source": "dexscreener_embed",
+    })
 
 @app.route("/api/debug")
 def api_debug():
